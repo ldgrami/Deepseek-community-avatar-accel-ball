@@ -6,28 +6,33 @@ import random
 import sys
 import threading
 import time
+import urllib.request
 from ctypes import wintypes
 
 if sys.platform != "win32":
     raise SystemExit("仅支持 Windows")
 
 import psutil
+import PySide6
 from PySide6.QtCore import (
     QEasingCurve,
     QFileInfo,
     QPoint,
     QPointF,
     QPropertyAnimation,
+    QRect,
     QRectF,
     QSize,
     Qt,
     QTimer,
+    QTranslator,
     Signal,
     Slot,
 )
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QIcon,
@@ -42,11 +47,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
+    QDialog,
     QFileIconProvider,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -63,6 +71,42 @@ advapi32 = ctypes.WinDLL("advapi32")
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32.CreateMutexW.restype = wintypes.HANDLE
 kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowThreadProcessId.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD),
+]
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.MonitorFromWindow.restype = wintypes.HMONITOR
+user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+MONITOR_DEFAULTTONEAREST = 2
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_SET_QUOTA = 0x0100
@@ -230,6 +274,38 @@ def close_processes(pids):
                 pass
 
 
+def foreground_is_fullscreen():
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        return False
+    if not user32.IsWindowVisible(hwnd):
+        return False
+    class_buffer = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, class_buffer, 256)
+    if class_buffer.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Button"):
+        return False
+    rect = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return False
+    mon = info.rcMonitor
+    tolerance = 2
+    return (
+        rect.left <= mon.left + tolerance
+        and rect.top <= mon.top + tolerance
+        and rect.right >= mon.right - tolerance
+        and rect.bottom >= mon.bottom - tolerance
+    )
+
+
 def _autostart_command():
     if FROZEN:
         return f'"{sys.executable}"'
@@ -283,6 +359,9 @@ DEFAULT_CONFIG = {
     "topmost": True,
     "edge_hide": True,
     "anim_seconds": 5,
+    "skip_confirm": False,
+    "handle_color": "#33d17a",
+    "hide_fullscreen": True,
 }
 MIN_SIZE = 90
 MAX_SIZE = 220
@@ -290,6 +369,7 @@ MIN_ANIM = 1
 MAX_ANIM = 30
 DOCK_HANDLE = 10
 DOCK_THRESHOLD = 22
+DOCK_HOVER_MARGIN = 12
 
 
 def load_config():
@@ -374,23 +454,323 @@ def _format_memory(num_bytes):
     return f"{num_bytes / 1048576:.0f} MB"
 
 
+def format_speed(bytes_per_second):
+    if bytes_per_second >= 1048576:
+        return f"{bytes_per_second / 1048576:.1f} MB/s"
+    if bytes_per_second >= 1024:
+        return f"{bytes_per_second / 1024:.0f} KB/s"
+    return f"{bytes_per_second:.0f} B/s"
+
+
+DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=5000000"
+UPLOAD_URL = "https://speed.cloudflare.com/__up"
+
+
+def measure_download_mbps(timeout=25):
+    start = time.time()
+    total = 0
+    request = urllib.request.Request(DOWNLOAD_URL, headers={"User-Agent": "accel-ball"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        while True:
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+    elapsed = time.time() - start
+    if elapsed <= 0 or total <= 0:
+        return 0.0
+    return total * 8 / elapsed / 1e6
+
+
+def measure_upload_mbps(size=2000000, timeout=30):
+    payload = os.urandom(size)
+    request = urllib.request.Request(
+        UPLOAD_URL,
+        data=payload,
+        method="POST",
+        headers={"User-Agent": "accel-ball", "Content-Type": "application/octet-stream"},
+    )
+    start = time.time()
+    urllib.request.urlopen(request, timeout=timeout).read()
+    elapsed = time.time() - start
+    if elapsed <= 0:
+        return 0.0
+    return size * 8 / elapsed / 1e6
+
+
+def normalize_proxy(value):
+    if not value:
+        return None
+    value = value.strip()
+    if "=" in value:
+        parts = {}
+        for chunk in value.split(";"):
+            if "=" in chunk:
+                key, val = chunk.split("=", 1)
+                parts[key.strip().lower()] = val.strip()
+        value = parts.get("https") or parts.get("http") or next(iter(parts.values()), "")
+        if not value:
+            return None
+    if "://" not in value:
+        value = "http://" + value
+    return value
+
+
+def detect_system_proxy():
+    for var in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        if os.environ.get(var):
+            return normalize_proxy(os.environ[var])
+    try:
+        import winreg
+
+        path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+            enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if enable:
+                server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                return normalize_proxy(server)
+    except Exception:
+        pass
+    return None
+
+
+def detect_proxy_country(proxy, timeout=6):
+    if not proxy:
+        return None, None
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+        request = urllib.request.Request(
+            "http://ip-api.com/json/?fields=status,country,countryCode&lang=zh-CN",
+            headers={"User-Agent": "accel-ball"},
+        )
+        with opener.open(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", "ignore"))
+        if data.get("status") == "success":
+            code = data.get("countryCode")
+            name = data.get("country") or code
+            return code, name
+    except Exception:
+        return None, None
+    return None, None
+
+
+def fetch_flag_bytes(code, proxy=None, timeout=6):
+    if not code or len(code) != 2:
+        return None
+    url = f"https://flagcdn.com/48x36/{code.lower()}.png"
+    try:
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+        else:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(url, headers={"User-Agent": "accel-ball"})
+        with opener.open(request, timeout=timeout) as response:
+            return response.read()
+    except Exception:
+        return None
+
+
+def measure_latency(url, proxy=None, timeout=6):
+    if "://" not in url:
+        url = "https://" + url
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+    else:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    last_exc = None
+    for method in ("HEAD", "GET"):
+        try:
+            start = time.time()
+            request = urllib.request.Request(
+                url, method=method, headers={"User-Agent": "accel-ball"}
+            )
+            opener.open(request, timeout=timeout).read(1024)
+            return (time.time() - start) * 1000
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc
+
+
+DIALOG_STYLE = """
+QDialog { background-color: #141b24; }
+QLabel { color: #dbe4ee; font-size: 13px; }
+QLineEdit {
+    background: #1b2431; color: #eaf1f8; border: 1px solid #2b3848;
+    border-radius: 8px; padding: 6px 10px; selection-background-color: #22c3e6;
+}
+QPushButton {
+    color: #c6d2df; background: #1c2632; border: 1px solid #2b3848;
+    border-radius: 8px; padding: 6px 14px;
+}
+QPushButton:hover { background: #243141; }
+QPushButton:disabled { color: #66727f; }
+"""
+
+
+class LatencyDialog(QDialog):
+    infoReady = Signal(object, object)
+    resultReady = Signal(str, str)
+
+    def __init__(self, proxy):
+        super().__init__(None)
+        self.proxy = proxy
+        self._testing = False
+        self.setWindowTitle("网络延迟测试")
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setMinimumWidth(400)
+        self.setStyleSheet(DIALOG_STYLE)
+        self._build_ui()
+        self.infoReady.connect(self._on_info)
+        self.resultReady.connect(self._on_result)
+        self._refresh_info()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        info_row = QHBoxLayout()
+        info_row.setSpacing(10)
+        self.flag_label = QLabel()
+        self.flag_label.setFixedSize(36, 27)
+        self.flag_label.setAlignment(Qt.AlignCenter)
+        info_row.addWidget(self.flag_label, 0, Qt.AlignTop)
+        self.info_label = QLabel("正在检测代理…")
+        self.info_label.setWordWrap(True)
+        info_row.addWidget(self.info_label, 1)
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self._refresh_info)
+        info_row.addWidget(self.refresh_btn, 0, Qt.AlignTop)
+        lay.addLayout(info_row)
+
+        row = QHBoxLayout()
+        self.url_edit = QLineEdit("https://www.google.com")
+        row.addWidget(self.url_edit, 1)
+        self.test_btn = QPushButton("测试延迟")
+        self.test_btn.setCursor(Qt.PointingHandCursor)
+        self.test_btn.clicked.connect(self._on_test)
+        row.addWidget(self.test_btn)
+        lay.addLayout(row)
+
+        self.direct_label = QLabel("直连延迟：--")
+        self.proxy_label = QLabel("代理延迟：--")
+        lay.addWidget(self.direct_label)
+        lay.addWidget(self.proxy_label)
+
+    def _refresh_info(self):
+        self.proxy = detect_system_proxy()
+        self.flag_label.clear()
+        self.info_label.setText("正在检测代理…")
+        self.refresh_btn.setEnabled(False)
+        threading.Thread(target=self._detect_worker, daemon=True).start()
+
+    def _detect_worker(self):
+        if self.proxy:
+            code, name = detect_proxy_country(self.proxy)
+            if name:
+                self.infoReady.emit(
+                    f"检测到代理：{self.proxy}\n代理地区：{name}",
+                    fetch_flag_bytes(code, self.proxy),
+                )
+            else:
+                self.infoReady.emit(
+                    f"检测到代理：{self.proxy}\n代理地区：获取失败", None
+                )
+        else:
+            self.infoReady.emit(
+                "未检测到系统代理（可能为直连，或代理处于 TUN 模式）", None
+            )
+
+    def _on_info(self, text, flag_bytes):
+        self.info_label.setText(text)
+        self.refresh_btn.setEnabled(True)
+        if flag_bytes:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(flag_bytes):
+                self.flag_label.setPixmap(
+                    pixmap.scaled(
+                        self.flag_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation,
+                    )
+                )
+            else:
+                self.flag_label.clear()
+        else:
+            self.flag_label.clear()
+
+    def _on_test(self):
+        if self._testing:
+            return
+        self._testing = True
+        self.test_btn.setEnabled(False)
+        self.test_btn.setText("测试中…")
+        self.direct_label.setText("直连延迟：测试中…")
+        self.proxy_label.setText("代理延迟：测试中…")
+        url = self.url_edit.text().strip()
+        threading.Thread(target=self._test_worker, args=(url,), daemon=True).start()
+
+    def _test_worker(self, url):
+        try:
+            direct = f"{measure_latency(url, None):.0f} ms"
+        except Exception:
+            direct = "失败 / 超时"
+        if self.proxy:
+            try:
+                proxied = f"{measure_latency(url, self.proxy):.0f} ms"
+            except Exception:
+                proxied = "失败 / 超时"
+        else:
+            proxied = "未检测到代理"
+        self.resultReady.emit(direct, proxied)
+
+    def _on_result(self, direct, proxied):
+        self._testing = False
+        self.test_btn.setEnabled(True)
+        self.test_btn.setText("测试延迟")
+        self.direct_label.setText(f"直连延迟：{direct}")
+        self.proxy_label.setText(f"代理延迟：{proxied}")
+
+
 class ProgramPanel(QWidget):
+    speedtestDone = Signal(object, object, object)
+
     def __init__(self, ball):
         super().__init__(None)
         self.ball = ball
         self._checks = {}
         self._all_checked = False
+        self._testing = False
 
         self.setWindowTitle("加速")
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(384, 524)
+        self.resize(384, 620)
         self._drag_pos = None
         self._icon_provider = QFileIconProvider()
         self._icon_cache = {}
+        self.speedtestDone.connect(self._finish_speedtest)
         self._build_ui()
+
+        self.net_timer = QTimer(self)
+        self.net_timer.timeout.connect(self._update_net)
+        self.net_timer.start(800)
 
     def _icon_for(self, exe):
         if not exe:
@@ -424,6 +804,11 @@ class ProgramPanel(QWidget):
         title.setObjectName("title")
         header.addWidget(title)
         header.addStretch(1)
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setObjectName("ghost")
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self.refresh_list)
+        header.addWidget(self.refresh_btn)
         close_btn = QPushButton("✕")
         close_btn.setObjectName("close")
         close_btn.setFixedSize(26, 26)
@@ -448,6 +833,27 @@ class ProgramPanel(QWidget):
         self.list_layout.addStretch(1)
         self.scroll.setWidget(self.list_host)
         lay.addWidget(self.scroll, 1)
+
+        net_row = QHBoxLayout()
+        net_row.setSpacing(10)
+        net_title = QLabel("实时网速")
+        net_title.setObjectName("sizeLabel")
+        net_row.addWidget(net_title)
+        self.net_value = QLabel("↓ 0 B/s   ↑ 0 B/s")
+        self.net_value.setObjectName("sizeValue")
+        self.net_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        net_row.addWidget(self.net_value, 1)
+        self.test_btn = QPushButton("测网速")
+        self.test_btn.setObjectName("ghost")
+        self.test_btn.setCursor(Qt.PointingHandCursor)
+        self.test_btn.clicked.connect(self._on_speedtest)
+        net_row.addWidget(self.test_btn)
+        lay.addLayout(net_row)
+
+        self.speed_result = QLabel("")
+        self.speed_result.setObjectName("hint")
+        self.speed_result.setVisible(False)
+        lay.addWidget(self.speed_result)
 
         size_row = QHBoxLayout()
         size_row.setSpacing(10)
@@ -484,6 +890,11 @@ class ProgramPanel(QWidget):
         self.anim_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         anim_row.addWidget(self.anim_value)
         lay.addLayout(anim_row)
+
+        self.skip_confirm = QCheckBox("加速时不再弹出确认提示")
+        self.skip_confirm.setChecked(bool(self.ball.cfg.get("skip_confirm", False)))
+        self.skip_confirm.toggled.connect(self._on_skip_confirm)
+        lay.addWidget(self.skip_confirm)
 
         footer = QHBoxLayout()
         self.select_all_btn = QPushButton("全选")
@@ -573,17 +984,18 @@ class ProgramPanel(QWidget):
             for name, (checkbox, _) in self._checks.items()
             if checkbox.isChecked()
         ]
-        preview = "、".join(names[:12]) + (" …" if len(names) > 12 else "")
-        box = QMessageBox(self)
-        box.setWindowTitle("确认加速")
-        box.setIcon(QMessageBox.Warning)
-        box.setText(f"将强制关闭以下 {len(names)} 个程序，未保存的数据会丢失：")
-        box.setInformativeText(preview)
-        ok = box.addButton("关闭并加速", QMessageBox.AcceptRole)
-        box.addButton("取消", QMessageBox.RejectRole)
-        box.exec()
-        if box.clickedButton() is not ok:
-            return
+        if not self.ball.cfg.get("skip_confirm", False):
+            preview = "、".join(names[:12]) + (" …" if len(names) > 12 else "")
+            box = QMessageBox(self)
+            box.setWindowTitle("确认加速")
+            box.setIcon(QMessageBox.Warning)
+            box.setText(f"将强制关闭以下 {len(names)} 个程序，未保存的数据会丢失：")
+            box.setInformativeText(preview)
+            ok = box.addButton("关闭并加速", QMessageBox.AcceptRole)
+            box.addButton("取消", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not ok:
+                return
         self.hide()
         close_processes(pids)
         self.ball.accelerate()
@@ -595,6 +1007,54 @@ class ProgramPanel(QWidget):
     def _on_anim_changed(self, value):
         self.anim_value.setText(f"{value}s")
         self.ball.set_anim_seconds(value)
+
+    def _on_skip_confirm(self, checked):
+        self.ball.set_skip_confirm(checked)
+
+    def _update_net(self):
+        self.net_value.setText(
+            f"↓ {format_speed(self.ball.down_speed)}   "
+            f"↑ {format_speed(self.ball.up_speed)}"
+        )
+
+    def _on_speedtest(self):
+        if self._testing:
+            return
+        self._testing = True
+        self.test_btn.setEnabled(False)
+        self.test_btn.setText("测速中…")
+        self.speed_result.setVisible(True)
+        self.speed_result.setText("正在测试下载 / 上传速度…")
+        threading.Thread(target=self._run_speedtest, daemon=True).start()
+
+    def _run_speedtest(self):
+        down = None
+        up = None
+        error = ""
+        try:
+            down = measure_download_mbps()
+        except Exception as exc:
+            error = f"下载测速失败（{exc}）"
+        else:
+            try:
+                up = measure_upload_mbps()
+            except Exception as exc:
+                error = f"上传测速失败（{exc}）"
+        self.speedtestDone.emit(down, up, error)
+
+    def _finish_speedtest(self, down, up, error):
+        self._testing = False
+        self.test_btn.setEnabled(True)
+        self.test_btn.setText("测网速")
+        parts = []
+        if down is not None:
+            parts.append(f"↓ {down:.1f} Mbps")
+        if up is not None:
+            parts.append(f"↑ {up:.1f} Mbps")
+        text = "　".join(parts)
+        if error:
+            text = (text + "  " if text else "") + error
+        self.speed_result.setText(text or "测速完成")
 
     def popup(self):
         self.refresh_list()
@@ -691,6 +1151,7 @@ class AccelBall(QWidget):
         self.dock_edge = None
         self._dragging = False
         self._docked_hidden = False
+        self._fullscreen_hidden = False
 
         self.setWindowTitle("加速球")
         flags = Qt.FramelessWindowHint | Qt.Tool | Qt.NoDropShadowWindowHint
@@ -715,11 +1176,13 @@ class AccelBall(QWidget):
                 continue
             movie = QMovie(path)
             movie.setCacheMode(QMovie.CacheNone)
+            movie.jumpToFrame(0)
             movie.frameChanged.connect(self._on_movie_frame)
             self.hover_movies.append(movie)
         self._last_hover_index = -1
         for movie in (self.normal_movie, self.work_movie):
             movie.setCacheMode(QMovie.CacheAll)
+            movie.jumpToFrame(0)
             movie.frameChanged.connect(self._on_movie_frame)
         self._active_movie = None
         self._working = False
@@ -729,6 +1192,11 @@ class AccelBall(QWidget):
         self._set_active_movie(self.normal_movie)
 
         self.bubble = SpeechBubble()
+
+        self.down_speed = 0.0
+        self.up_speed = 0.0
+        self._net_prev = psutil.net_io_counters()
+        self._net_prev_time = time.time()
 
         self._build_menu()
         self._build_tray()
@@ -742,6 +1210,14 @@ class AccelBall(QWidget):
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self._tick)
         self.anim_timer.start(33)
+
+        self.hover_timer = QTimer(self)
+        self.hover_timer.timeout.connect(self._poll_dock)
+        self.hover_timer.start(80)
+
+        self.fs_timer = QTimer(self)
+        self.fs_timer.timeout.connect(self._check_fullscreen)
+        self.fs_timer.start(1000)
 
         self.refresh()
         self._move_to_corner()
@@ -767,6 +1243,23 @@ class AccelBall(QWidget):
         self.act_edge.toggled.connect(self._set_edge_hide)
         self.menu.addAction(self.act_edge)
 
+        self.act_fullscreen = QAction("全屏应用时自动隐藏", self, checkable=True)
+        self.act_fullscreen.setChecked(self.cfg.get("hide_fullscreen", True))
+        self.act_fullscreen.toggled.connect(self._set_hide_fullscreen)
+        self.menu.addAction(self.act_fullscreen)
+
+        handle_menu = self.menu.addMenu("贴边小条颜色")
+        act_handle_custom = QAction("自定义正常颜色…", self)
+        act_handle_custom.triggered.connect(self._pick_handle_color)
+        handle_menu.addAction(act_handle_custom)
+        act_handle_reset = QAction("恢复默认颜色", self)
+        act_handle_reset.triggered.connect(self._reset_handle_color)
+        handle_menu.addAction(act_handle_reset)
+
+        act_latency = QAction("网络延迟测试…", self)
+        act_latency.triggered.connect(self._open_latency)
+        self.menu.addAction(act_latency)
+
         self.act_auto = QAction("开机自启", self, checkable=True)
         self.act_auto.setChecked(is_autostart_enabled())
         self.act_auto.toggled.connect(self._set_autostart)
@@ -788,7 +1281,8 @@ class AccelBall(QWidget):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, checked)
         self.cfg["topmost"] = checked
         save_config(self.cfg)
-        self.show()
+        if not self._fullscreen_hidden:
+            self.show()
 
     def _set_edge_hide(self, checked):
         self.cfg["edge_hide"] = checked
@@ -801,11 +1295,62 @@ class AccelBall(QWidget):
         else:
             self._check_dock()
 
+    def _set_hide_fullscreen(self, checked):
+        self.cfg["hide_fullscreen"] = checked
+        save_config(self.cfg)
+        if not checked and self._fullscreen_hidden:
+            self._restore_from_fullscreen()
+
+    def _check_fullscreen(self):
+        if not self.cfg.get("hide_fullscreen", True):
+            return
+        fullscreen = foreground_is_fullscreen()
+        if fullscreen:
+            self.bubble.hide()
+            if self.panel.isVisible():
+                self.panel.hide()
+            if not self._fullscreen_hidden:
+                self._fullscreen_hidden = True
+                self.anim_timer.stop()
+                self.hover_timer.stop()
+            if self.isVisible():
+                self.hide()
+        elif self._fullscreen_hidden:
+            self._restore_from_fullscreen()
+
+    def _restore_from_fullscreen(self):
+        self._fullscreen_hidden = False
+        self.show()
+        self.anim_timer.start(33)
+        self.hover_timer.start(80)
+        if self.dock_edge:
+            self._check_dock()
+
     def _set_autostart(self, checked):
         try:
             set_autostart(checked)
         except OSError:
             self.act_auto.setChecked(is_autostart_enabled())
+
+    def _pick_handle_color(self):
+        initial = QColor(self.cfg.get("handle_color", "#33d17a"))
+        dialog = QColorDialog(initial, self)
+        dialog.setOption(QColorDialog.DontUseNativeDialog, True)
+        dialog.setWindowTitle("选择贴边小条颜色")
+        if dialog.exec():
+            color = dialog.selectedColor()
+            if color.isValid():
+                self.cfg["handle_color"] = color.name()
+                save_config(self.cfg)
+                self.update()
+
+    def _reset_handle_color(self):
+        self.cfg["handle_color"] = "#33d17a"
+        save_config(self.cfg)
+        self.update()
+
+    def _open_latency(self):
+        LatencyDialog(detect_system_proxy()).exec()
 
     def set_size(self, size):
         size = int(max(MIN_SIZE, min(MAX_SIZE, size)))
@@ -826,20 +1371,27 @@ class AccelBall(QWidget):
         if self._working:
             self.work_timer.start(seconds * 1000)
 
+    def set_skip_confirm(self, value):
+        self.cfg["skip_confirm"] = bool(value)
+        save_config(self.cfg)
+
     def _on_movie_frame(self, frame):
         self.update()
 
-    def _set_active_movie(self, movie):
+    def _set_active_movie(self, movie, restart=False):
         if movie is None or not movie.isValid():
             if self._active_movie is not None:
                 self._active_movie.stop()
             self._active_movie = None
             self.update()
             return
-        if self._active_movie is not None and self._active_movie is not movie:
-            self._active_movie.stop()
+        if self._active_movie is not movie:
+            if self._active_movie is not None:
+                self._active_movie.stop()
+            restart = True
         self._active_movie = movie
-        if movie.state() != QMovie.Running:
+        if restart or movie.state() != QMovie.Running:
+            movie.stop()
             movie.jumpToFrame(0)
             movie.start()
         self.update()
@@ -848,7 +1400,8 @@ class AccelBall(QWidget):
         if not self.work_movie.isValid():
             return
         self._working = True
-        self._set_active_movie(self.work_movie)
+        self._set_active_movie(self.work_movie, restart=True)
+        self.update()
         self.work_timer.start(int(self.cfg.get("anim_seconds", 5)) * 1000)
 
     def _end_work_animation(self):
@@ -874,8 +1427,6 @@ class AccelBall(QWidget):
         self.bubble.raise_()
 
     def _update_bubble_position(self):
-        if not self.bubble.isVisible():
-            return
         if self.dock_edge:
             flush, _ = self._edge_positions()
             base_x, base_y = flush.x(), flush.y()
@@ -1009,9 +1560,11 @@ class AccelBall(QWidget):
         vm = psutil.virtual_memory()
         self.percent = float(vm.percent)
         used = vm.total - vm.available
+        self._update_net_speed()
         self.setToolTip(
             f"内存占用 {vm.percent}%\n"
             f"已用 {used / 1073741824:.1f} / {vm.total / 1073741824:.1f} GB\n"
+            f"网速 ↓ {format_speed(self.down_speed)}  ↑ {format_speed(self.up_speed)}\n"
             "左键打开面板 · 拖动移动 · 右键菜单"
         )
         self.tray.setIcon(self._tray_icon())
@@ -1019,6 +1572,20 @@ class AccelBall(QWidget):
             self.bubble.set_text(f"内存占用 {int(self.percent)}%")
             self._update_bubble_position()
         self.update()
+
+    def _update_net_speed(self):
+        now = time.time()
+        counters = psutil.net_io_counters()
+        elapsed = now - self._net_prev_time
+        if elapsed > 0:
+            self.down_speed = max(
+                0.0, (counters.bytes_recv - self._net_prev.bytes_recv) / elapsed
+            )
+            self.up_speed = max(
+                0.0, (counters.bytes_sent - self._net_prev.bytes_sent) / elapsed
+            )
+        self._net_prev = counters
+        self._net_prev_time = now
 
     def _tray_icon(self):
         movie = self._active_movie
@@ -1153,10 +1720,19 @@ class AccelBall(QWidget):
         p.setPen(QColor(224, 232, 242, 235))
         p.drawText(label_rect, Qt.AlignCenter, self.status_label)
 
+    def _handle_color(self):
+        if self.busy:
+            return QColor("#22c3e6")
+        if self.percent >= 85:
+            return QColor("#ff5b5b")
+        if self.percent >= 60:
+            return QColor("#f5a623")
+        return QColor(self.cfg.get("handle_color", "#33d17a"))
+
     def _paint_dock_handle(self, painter):
         if not (self.dock_edge and self._docked_hidden):
             return
-        color = self.current_color()
+        color = self._handle_color()
         side = min(self.width(), self.height())
         length = side * 0.42
         radius = DOCK_HANDLE / 2.0
@@ -1203,6 +1779,8 @@ class AccelBall(QWidget):
             return
         self.busy = True
         self.status_label = "释放中…"
+        if self.dock_edge and self._docked_hidden:
+            self.show_from_edge()
         self._start_work_animation()
         self.update()
         threading.Thread(target=self._work, daemon=True).start()
@@ -1246,6 +1824,7 @@ class AccelBall(QWidget):
         if event.button() == Qt.LeftButton:
             self.dock_anim.stop()
             self._dragging = True
+            self.bubble.hide()
             self._press_pos = event.globalPosition().toPoint()
             self._start_pos = self.pos()
             self._moved = False
@@ -1269,22 +1848,74 @@ class AccelBall(QWidget):
             self._check_dock()
 
     def enterEvent(self, event):
-        self.hover = True
         if self.dock_edge:
             self.show_from_edge()
-        if not self._working and not self._dragging and self.hover_movies:
-            self._play_random_hover()
-        self._show_bubble()
+        else:
+            self.hover = True
+            if not self._working and not self._dragging and self.hover_movies:
+                self._play_random_hover()
+            self._show_bubble()
         self.update()
 
     def leaveEvent(self, event):
+        if self.dock_edge:
+            return
         self.hover = False
         self.bubble.hide()
-        if self.dock_edge and not self._dragging:
-            self.hide_to_edge()
         if not self._working:
             self._set_active_movie(self.normal_movie)
         self.update()
+
+    def _dock_active_rect(self):
+        if self.dock_edge:
+            flush, _ = self._edge_positions()
+            rect = QRect(flush.x(), flush.y(), self.width(), self.height())
+        else:
+            rect = self.frameGeometry()
+        return rect.adjusted(
+            -DOCK_HOVER_MARGIN, -DOCK_HOVER_MARGIN, DOCK_HOVER_MARGIN, DOCK_HOVER_MARGIN
+        )
+
+    def _poll_dock(self):
+        if self.dock_edge is None or self._dragging:
+            return
+        if self._working:
+            if self._docked_hidden:
+                self.show_from_edge()
+            return
+        inside = self._dock_active_rect().contains(QCursor.pos())
+        if inside:
+            if self._docked_hidden:
+                self.show_from_edge()
+            if not self.hover:
+                self.hover = True
+                if not self._working and self.hover_movies:
+                    self._play_random_hover()
+                self._show_bubble()
+        else:
+            if not self._docked_hidden:
+                self.hide_to_edge()
+            if self.hover:
+                self.hover = False
+                self.bubble.hide()
+                if not self._working:
+                    self._set_active_movie(self.normal_movie)
+
+
+def install_translations(app):
+    translator = QTranslator(app)
+    search_dirs = [os.path.join(os.path.dirname(PySide6.__file__), "translations")]
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        search_dirs.append(os.path.join(bundle, "translations"))
+        search_dirs.append(
+            os.path.join(bundle, "PySide6", "translations")
+        )
+    for directory in search_dirs:
+        if translator.load("qtbase_zh_CN", directory):
+            app.installTranslator(translator)
+            return translator
+    return None
 
 
 def main():
@@ -1292,6 +1923,7 @@ def main():
     if mutex is None:
         return
     app = QApplication(sys.argv)
+    install_translations(app)
     app.setApplicationName("AccelBall")
     app.setQuitOnLastWindowClosed(False)
     ball = AccelBall()
